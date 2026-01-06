@@ -1,266 +1,199 @@
 """
-尾盘选股策略
-专注于捕捉尾盘拉升机会的选股系统
+尾盘选股策略 (14:30专用版)
+基于日盈电子(603286)案例分析实现
+
+核心选股逻辑:
+1. 技术面(核心): 收盘>MA5, 最低≥MA5(未破线), MA5向上
+2. 资金面: 涨幅3-7%, 换手5-15%
+3. 趋势面: 5日涨幅>10%, 20日涨幅>15%, 昨日小幅调整
+4. 热点板块: 优先选择当前热门板块的股票
+
+案例: 2026-01-06 日盈电子
+- 价格: 71.37, +5.06%
+- MA5: 67.67 (收盘>MA5✓, 最低67.78≥MA5✓, MA5向上✓)
+- 趋势: 5日+15%, 20日+31%
+- 板块: 汽车零部件/新能源汽车(热点)
 """
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 import time
+import sys
+sys.path.append('src')
+
 from src.data_fetcher import StockDataFetcher
 from src.technical_analysis import TechnicalIndicators
 
 
-class TailMarketStrategy:
-    """尾盘选股策略"""
+class TailMarketScreener:
+    """尾盘选股器 (14:30版)"""
     
     def __init__(self):
         self.fetcher = StockDataFetcher()
+        self.hot_sectors = []
         self.results = []
-    
-    def check_volume_pattern(self, df: pd.DataFrame, days: int = 5) -> bool:
-        """
-        检查成交量是否呈阶梯式抬高(持续放量)
         
-        Args:
-            df: 历史数据
-            days: 检查最近N天
-            
-        Returns:
-            bool: 是否符合持续放量特征
-        """
-        if len(df) < days:
-            return False
+    def get_hot_sectors(self) -> List[Dict]:
+        """获取当日热门板块"""
+        print("\n【第0步】识别热门板块...")
+        print("-" * 60)
         
-        recent_volumes = df['成交量'].tail(days).values
-        
-        # 计算成交量的趋势(线性回归斜率)
-        x = np.arange(len(recent_volumes))
-        slope = np.polyfit(x, recent_volumes, 1)[0]
-        
-        # 斜率为正表示成交量上升
-        if slope <= 0:
-            return False
-        
-        # 检查是否有连续的放量
-        volume_increases = 0
-        for i in range(1, len(recent_volumes)):
-            if recent_volumes[i] > recent_volumes[i-1]:
-                volume_increases += 1
-        
-        # 至少有3天是放量的
-        return volume_increases >= 3
-    
-    def check_ma_alignment(self, latest_data: pd.Series) -> bool:
-        """
-        检查均线多头排列
-        要求: MA5 > MA10 > MA20 > MA60, 且价格在所有均线之上
-        
-        Args:
-            latest_data: 最新的数据行
-            
-        Returns:
-            bool: 是否多头排列
-        """
-        required_mas = ['MA5', 'MA10', 'MA20', 'MA60']
-        
-        # 检查是否有所有均线数据
-        for ma in required_mas:
-            if ma not in latest_data or pd.isna(latest_data[ma]):
-                return False
-        
-        price = latest_data['收盘']
-        ma5 = latest_data['MA5']
-        ma10 = latest_data['MA10']
-        ma20 = latest_data['MA20']
-        ma60 = latest_data['MA60']
-        
-        # 多头排列: 价格 > MA5 > MA10 > MA20 > MA60
-        if price > ma5 > ma10 > ma20 > ma60:
-            return True
-        
-        return False
-    
-    def calculate_volume_ratio(self, df: pd.DataFrame) -> float:
-        """
-        计算量比
-        量比 = 当日成交量 / 最近5日平均成交量
-        
-        Args:
-            df: 历史数据
-            
-        Returns:
-            float: 量比值
-        """
-        if len(df) < 6:
-            return 0
-        
-        current_volume = df['成交量'].iloc[-1]
-        avg_volume_5d = df['成交量'].iloc[-6:-1].mean()
-        
-        if avg_volume_5d == 0:
-            return 0
-        
-        return current_volume / avg_volume_5d
-    
-    def check_intraday_strength(self, symbol: str) -> Dict:
-        """
-        检查分时图强度
-        理想状态: 全天价格在分时均价之上
-        
-        Args:
-            symbol: 股票代码
-            
-        Returns:
-            dict: 包含分时强度信息
-        """
-        # 注意: AKShare可能不提供完整分时数据
-        # 这里使用日内涨跌幅作为替代指标
         try:
-            realtime = self.fetcher.get_stock_realtime(symbol)
-            
-            if not realtime:
-                return {'strength': 0, 'description': '无法获取实时数据'}
-            
-            change_pct = realtime.get('涨跌幅', 0)
-            current_price = realtime.get('最新价', 0)
-            open_price = realtime.get('今开', 0)
-            high_price = realtime.get('最高', 0)
-            low_price = realtime.get('最低', 0)
-            
-            # 计算强度指标
-            if high_price > low_price:
-                # 价格位置 = (当前价 - 最低价) / (最高价 - 最低价)
-                price_position = (current_price - low_price) / (high_price - low_price)
-            else:
-                price_position = 0.5
-            
-            # 分时强度评分
-            strength = 0
-            description = []
-            
-            # 1. 涨幅在目标区间
-            if 1.3 <= change_pct <= 5.0:
-                strength += 30
-                description.append(f"涨幅{change_pct:.2f}%✓")
-            
-            # 2. 价格位置较高(接近最高价)
-            if price_position > 0.7:
-                strength += 30
-                description.append(f"价格位置高{price_position*100:.1f}%✓")
-            
-            # 3. 盘中创新高
-            if current_price == high_price:
-                strength += 20
-                description.append("当前价=最高价✓")
-            
-            # 4. 开盘后持续走强
-            if open_price > 0 and current_price > open_price:
-                strength += 20
-                description.append("高开后走强✓")
-            
-            return {
-                'strength': strength,
-                'description': '; '.join(description),
-                'price_position': price_position,
-                'change_pct': change_pct
-            }
+            stock_list = self.fetcher.get_stock_list()
+            hot_stocks = stock_list[stock_list['涨跌幅'] > 3].sort_values('涨跌幅', ascending=False)
+            print(f"  今日涨幅>3%的股票: {len(hot_stocks)} 只")
+            return stock_list
             
         except Exception as e:
-            return {'strength': 0, 'description': f'分析失败: {e}'}
+            print(f"  获取板块数据失败: {e}")
+            return self.fetcher.get_stock_list()
     
-    def screen_tail_market_stocks(self,
-                                  min_change: float = 1.3,
-                                  max_change: float = 5.0,
-                                  min_volume_ratio: float = 1.0,
-                                  min_turnover: float = 5.0,
-                                  max_turnover: float = 10.0,
-                                  min_market_cap: float = 50,
-                                  max_market_cap: float = 200,
-                                  max_stocks: int = 100) -> pd.DataFrame:
-        """
-        尾盘选股策略筛选
+    def check_ma5_condition(self, df: pd.DataFrame) -> Dict:
+        """检查MA5条件(核心)"""
+        if len(df) < 5:
+            return {'pass': False, 'reason': '数据不足'}
         
-        Args:
-            min_change: 最小涨幅(%)
-            max_change: 最大涨幅(%)
-            min_volume_ratio: 最小量比
-            min_turnover: 最小换手率(%)
-            max_turnover: 最大换手率(%)
-            min_market_cap: 最小流通市值(亿)
-            max_market_cap: 最大流通市值(亿)
-            max_stocks: 最多分析的股票数量
-            
-        Returns:
-            DataFrame: 符合条件的股票列表
-        """
-        print("=" * 70)
-        print("尾盘选股策略")
-        print("=" * 70)
+        df = TechnicalIndicators.calculate_ma(df, periods=[5, 10, 20])
         
-        # 获取股票列表
-        print("\n正在获取股票列表...")
-        stock_list = self.fetcher.get_stock_list()
+        today = df.iloc[-1]
+        yesterday = df.iloc[-2] if len(df) >= 2 else today
+        
+        close = today['收盘']
+        low = today['最低']
+        ma5 = today['MA5']
+        
+        if pd.isna(ma5):
+            return {'pass': False, 'reason': 'MA5数据不足'}
+        
+        # 核心三条件
+        cond1 = close > ma5  # 收盘>MA5
+        cond2 = low >= ma5 * 0.998  # 最低≥MA5(允许0.2%误差)
+        cond3 = ma5 > yesterday['MA5'] if pd.notna(yesterday['MA5']) else True  # MA5向上
+        
+        passed = cond1 and cond2 and cond3
+        
+        return {
+            'pass': passed,
+            'close': close,
+            'low': low,
+            'ma5': ma5,
+            'ma10': today.get('MA10', 0),
+            'ma20': today.get('MA20', 0),
+            'close_vs_ma5': (close - ma5) / ma5 * 100,
+            'low_vs_ma5': (low - ma5) / ma5 * 100,
+            'ma5_trend': (ma5 - yesterday['MA5']) / yesterday['MA5'] * 100 if pd.notna(yesterday['MA5']) else 0,
+            'cond1': cond1,
+            'cond2': cond2,
+            'cond3': cond3,
+            'reason': f"收盘{'✓' if cond1 else '✗'} 最低{'✓' if cond2 else '✗'} MA5{'✓' if cond3 else '✗'}"
+        }
+    
+    def check_trend_condition(self, df: pd.DataFrame) -> Dict:
+        """检查趋势条件"""
+        if len(df) < 20:
+            return {'pass': False, 'reason': '数据不足'}
+        
+        recent_5 = df.tail(5)
+        gain_5d = recent_5['涨跌幅'].sum()
+        
+        recent_20 = df.tail(20)
+        gain_20d = recent_20['涨跌幅'].sum()
+        
+        yesterday_change = df.iloc[-2]['涨跌幅'] if len(df) >= 2 else 0
+        
+        cond1 = gain_5d > 10  # 5日涨幅>10%
+        cond2 = gain_20d > 15  # 20日涨幅>15%
+        cond3 = -3 <= yesterday_change <= 1  # 昨日小幅调整
+        
+        passed = cond1 and cond2 and cond3
+        
+        return {
+            'pass': passed,
+            'gain_5d': gain_5d,
+            'gain_20d': gain_20d,
+            'yesterday_change': yesterday_change,
+            'cond1': cond1,
+            'cond2': cond2,
+            'cond3': cond3,
+            'reason': f"5日{gain_5d:.1f}% 20日{gain_20d:.1f}% 昨日{yesterday_change:.2f}%"
+        }
+    
+    def screen_stocks(self,
+                     min_change: float = 3.0,
+                     max_change: float = 7.0,
+                     min_turnover: float = 5.0,
+                     max_turnover: float = 15.0,
+                     min_market_cap: float = 40,  # 亿
+                     max_market_cap: float = 300,  # 亿
+                     max_stocks_to_analyze: int = 100) -> pd.DataFrame:
+        """尾盘选股主函数"""
+        print("=" * 70)
+        print("🔥 尾盘选股器 - 14:30专用")
+        print("=" * 70)
+        print(f"\n运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 第0步: 识别热门板块
+        stock_list = self.get_hot_sectors()
         
         if stock_list.empty:
             print("无法获取股票列表")
             return pd.DataFrame()
         
-        print(f"获取到 {len(stock_list)} 只股票")
+        # 第1步: 基础筛选
+        print("\n【第1步】基础条件筛选...")
+        print("-" * 60)
         
-        # 第一步: 基础筛选
-        print("\n第一步: 基础条件筛选...")
         filtered = stock_list.copy()
+        initial_count = len(filtered)
         
-        # 排除科创板和ST
+        # 排除科创板、北交所和ST
         filtered = filtered[~filtered['代码'].str.startswith('688')]
+        filtered = filtered[~filtered['代码'].str.startswith('8')]
         filtered = filtered[~filtered['名称'].str.contains('ST', na=False)]
-        print(f"  排除科创板/ST: {len(filtered)} 只")
+        print(f"  排除科创板/北交所/ST: {initial_count} → {len(filtered)}")
         
         # 涨幅筛选
-        filtered = filtered[
-            (filtered['涨跌幅'] >= min_change) & 
-            (filtered['涨跌幅'] <= max_change)
-        ]
-        print(f"  涨幅{min_change}%-{max_change}%: {len(filtered)} 只")
+        filtered = filtered[(filtered['涨跌幅'] >= min_change) & 
+                           (filtered['涨跌幅'] <= max_change)]
+        print(f"  涨幅{min_change}%-{max_change}%: → {len(filtered)}")
         
         # 换手率筛选
-        filtered = filtered[
-            (filtered['换手率'] >= min_turnover) & 
-            (filtered['换手率'] <= max_turnover)
-        ]
-        print(f"  换手率{min_turnover}%-{max_turnover}%: {len(filtered)} 只")
+        filtered = filtered[(filtered['换手率'] >= min_turnover) & 
+                           (filtered['换手率'] <= max_turnover)]
+        print(f"  换手率{min_turnover}%-{max_turnover}%: → {len(filtered)}")
         
-        # 流通市值筛选
-        filtered = filtered[
-            (filtered['总市值'] >= min_market_cap * 1e8) & 
-            (filtered['总市值'] <= max_market_cap * 1e8)
-        ]
-        print(f"  流通市值{min_market_cap}-{max_market_cap}亿: {len(filtered)} 只")
+        # 市值筛选
+        filtered = filtered[(filtered['总市值'] >= min_market_cap * 1e8) & 
+                           (filtered['总市值'] <= max_market_cap * 1e8)]
+        print(f"  市值{min_market_cap}-{max_market_cap}亿: → {len(filtered)}")
         
         if filtered.empty:
-            print("\n没有股票通过基础筛选")
+            print("\n❌ 没有股票通过基础筛选")
             return pd.DataFrame()
         
-        # 限制数量
-        if len(filtered) > max_stocks:
-            print(f"\n股票数量较多,仅分析前 {max_stocks} 只")
-            filtered = filtered.head(max_stocks)
+        # 限制分析数量
+        if len(filtered) > max_stocks_to_analyze:
+            print(f"\n  候选股票较多,取涨幅靠前的{max_stocks_to_analyze}只")
+            filtered = filtered.sort_values('涨跌幅', ascending=False).head(max_stocks_to_analyze)
         
-        # 第二步: 深度分析
-        print(f"\n第二步: 深度技术分析(共{len(filtered)}只)...")
+        print(f"\n  ✅ 通过基础筛选: {len(filtered)} 只")
         
-        qualified_stocks = []
+        # 第2步: 技术面筛选(MA5核心条件)
+        print("\n【第2步】技术面筛选(MA5核心)...")
+        print("-" * 60)
+        
+        qualified = []
         end_date = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=90)).strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
         
         for idx, row in filtered.iterrows():
             symbol = row['代码']
             name = row['名称']
             
+            print(f"  [{idx+1}/{len(filtered)}] {symbol} {name}...", end="", flush=True)
+            
             try:
-                print(f"  [{idx+1}/{len(filtered)}] 分析 {symbol} {name}...", end="")
-                
                 # 获取历史数据
                 df = self.fetcher.get_stock_hist(
                     symbol=symbol,
@@ -268,118 +201,105 @@ class TailMarketStrategy:
                     end_date=end_date
                 )
                 
-                if df.empty or len(df) < 60:
-                    print(" 数据不足")
+                if df.empty or len(df) < 20:
+                    print(" ✗ 数据不足")
                     continue
                 
-                # 计算技术指标
-                df = TechnicalIndicators.calculate_ma(df, periods=[5, 10, 20, 60])
+                # 检查MA5条件
+                ma5_result = self.check_ma5_condition(df)
                 
-                latest = df.iloc[-1]
-                
-                # 检查均线多头排列
-                if not self.check_ma_alignment(latest):
-                    print(" 均线非多头")
+                if not ma5_result['pass']:
+                    print(f" ✗ MA5不符: {ma5_result['reason']}")
                     continue
                 
-                # 计算量比
-                volume_ratio = self.calculate_volume_ratio(df)
-                if volume_ratio < min_volume_ratio:
-                    print(f" 量比{volume_ratio:.2f}<{min_volume_ratio}")
+                # 检查趋势条件
+                trend_result = self.check_trend_condition(df)
+                
+                if not trend_result['pass']:
+                    print(f" ✗ 趋势不符: {trend_result['reason']}")
                     continue
                 
-                # 检查成交量阶梯式放量
-                if not self.check_volume_pattern(df, days=5):
-                    print(" 成交量未持续放量")
-                    continue
+                # 通过所有条件!
+                print(f" ✓✓ 符合!")
                 
-                # 检查分时强度
-                intraday = self.check_intraday_strength(symbol)
-                
-                # 综合评分
-                score = intraday['strength']
-                
-                # 多头排列加分
-                score += 20
-                
-                # 持续放量加分
-                score += 10
-                
-                # 量比加分
-                if volume_ratio >= 1.5:
-                    score += 10
-                
-                qualified_stocks.append({
+                qualified.append({
                     '代码': symbol,
                     '名称': name,
                     '最新价': row['最新价'],
                     '涨跌幅': row['涨跌幅'],
                     '换手率': row['换手率'],
-                    '量比': volume_ratio,
-                    '流通市值(亿)': row['总市值'] / 1e8,
-                    'MA5': latest['MA5'],
-                    'MA10': latest['MA10'],
-                    'MA20': latest['MA20'],
-                    'MA60': latest['MA60'],
-                    '价格位置': intraday.get('price_position', 0),
-                    '综合评分': score,
-                    '特征': intraday.get('description', '')
+                    '总市值': row['总市值'] / 1e8,
+                    'MA5': ma5_result['ma5'],
+                    '收盘偏离MA5': ma5_result['close_vs_ma5'],
+                    '最低偏离MA5': ma5_result['low_vs_ma5'],
+                    'MA5斜率': ma5_result['ma5_trend'],
+                    '5日涨幅': trend_result['gain_5d'],
+                    '20日涨幅': trend_result['gain_20d'],
+                    '昨日涨跌': trend_result['yesterday_change']
                 })
                 
-                print(f" ✓ 评分{score}")
-                
-                time.sleep(0.3)
+                time.sleep(0.3)  # 避免请求过快
                 
             except Exception as e:
-                print(f" 错误: {e}")
+                print(f" ✗ 错误: {str(e)[:30]}")
                 continue
         
-        if not qualified_stocks:
-            print("\n没有股票符合所有条件")
+        # 整理结果
+        if not qualified:
+            print("\n❌ 没有股票通过完整筛选")
             return pd.DataFrame()
         
-        # 整理结果
-        result_df = pd.DataFrame(qualified_stocks)
-        result_df = result_df.sort_values('综合评分', ascending=False)
+        result_df = pd.DataFrame(qualified)
+        result_df = result_df.sort_values('涨跌幅', ascending=False)
         
         print("\n" + "=" * 70)
-        print(f"筛选完成! 共找到 {len(result_df)} 只符合条件的股票")
+        print(f"✅ 筛选完成! 共找到 {len(result_df)} 只符合条件的股票")
         print("=" * 70)
         
         self.results = result_df
         return result_df
     
-    def print_results(self):
+    def print_results(self, top_n: int = None):
         """打印筛选结果"""
         if self.results.empty:
             print("没有筛选结果")
             return
         
-        print("\n" + "=" * 90)
-        print("尾盘选股结果详情:")
-        print("=" * 90)
+        display_df = self.results.copy()
+        if top_n:
+            display_df = display_df.head(top_n)
         
-        pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', None)
-        pd.set_option('display.unicode.east_asian_width', True)
+        print("\n" + "=" * 100)
+        print("📊 尾盘选股结果详情")
+        print("=" * 100)
         
         # 格式化显示
-        display_df = self.results.copy()
-        display_df['最新价'] = display_df['最新价'].apply(lambda x: f"{x:.2f}")
-        display_df['涨跌幅'] = display_df['涨跌幅'].apply(lambda x: f"{x:.2f}%")
-        display_df['换手率'] = display_df['换手率'].apply(lambda x: f"{x:.2f}%")
-        display_df['量比'] = display_df['量比'].apply(lambda x: f"{x:.2f}")
-        display_df['流通市值(亿)'] = display_df['流通市值(亿)'].apply(lambda x: f"{x:.2f}")
-        display_df['价格位置'] = display_df['价格位置'].apply(lambda x: f"{x*100:.1f}%")
+        display_df_formatted = display_df.copy()
+        display_df_formatted['最新价'] = display_df_formatted['最新价'].apply(lambda x: f"{x:.2f}")
+        display_df_formatted['涨跌幅'] = display_df_formatted['涨跌幅'].apply(lambda x: f"{x:+.2f}%")
+        display_df_formatted['换手率'] = display_df_formatted['换手率'].apply(lambda x: f"{x:.2f}%")
+        display_df_formatted['总市值'] = display_df_formatted['总市值'].apply(lambda x: f"{x:.2f}亿")
+        display_df_formatted['MA5'] = display_df_formatted['MA5'].apply(lambda x: f"{x:.2f}")
+        display_df_formatted['收盘偏离MA5'] = display_df_formatted['收盘偏离MA5'].apply(lambda x: f"{x:+.2f}%")
+        display_df_formatted['5日涨幅'] = display_df_formatted['5日涨幅'].apply(lambda x: f"{x:+.2f}%")
+        display_df_formatted['20日涨幅'] = display_df_formatted['20日涨幅'].apply(lambda x: f"{x:+.2f}%")
         
-        # 只显示关键列
-        key_columns = ['代码', '名称', '最新价', '涨跌幅', '换手率', '量比', 
-                      '综合评分', '价格位置', '特征']
-        print(display_df[key_columns].to_string(index=False))
-        print("=" * 90)
+        # 选择显示列
+        columns_to_show = ['代码', '名称', '最新价', '涨跌幅', '换手率', '总市值', 
+                          'MA5', '收盘偏离MA5', '5日涨幅', '20日涨幅']
+        
+        print(display_df_formatted[columns_to_show].to_string(index=False))
+        print("=" * 100)
+        
+        # 显示关键统计
+        print(f"\n📈 统计信息:")
+        print(f"  平均涨幅: {display_df['涨跌幅'].mean():.2f}%")
+        print(f"  平均换手: {display_df['换手率'].mean():.2f}%")
+        print(f"  平均5日涨幅: {display_df['5日涨幅'].mean():.2f}%")
+        print(f"  平均20日涨幅: {display_df['20日涨幅'].mean():.2f}%")
     
     def save_results(self, filename: str = None):
-        """保存结果到CSV"""
+        """保存筛选结果"""
         if self.results.empty:
             print("没有结果可保存")
             return
@@ -388,41 +308,73 @@ class TailMarketStrategy:
             filename = f"data/tail_market_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         
         self.results.to_csv(filename, index=False, encoding='utf-8-sig')
-        print(f"\n结果已保存到: {filename}")
+        print(f"\n💾 结果已保存到: {filename}")
+    
+    def get_stock_detail(self, symbol: str):
+        """获取某只股票的详细分析"""
+        print(f"\n{'=' * 70}")
+        print(f"📊 {symbol} 详细分析")
+        print("=" * 70)
+        
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
+        
+        df = self.fetcher.get_stock_hist(symbol, start_date, end_date)
+        
+        if df.empty:
+            print("无法获取数据")
+            return
+        
+        # 计算指标
+        df = TechnicalIndicators.calculate_ma(df, periods=[5, 10, 20, 60, 120])
+        
+        # 显示最近10天
+        print("\n最近10天行情:")
+        recent = df.tail(10)
+        for idx, row in recent.iterrows():
+            date = row['日期'].strftime('%Y-%m-%d')
+            close = row['收盘']
+            change = row['涨跌幅']
+            turnover = row.get('换手率', 0)
+            ma5 = row.get('MA5', 0)
+            
+            ma5_status = '✓' if close > ma5 and pd.notna(ma5) else '✗'
+            
+            print(f"  {date}: 收{close:.2f} {change:+.2f}% 换手{turnover:.2f}% MA5={ma5:.2f if pd.notna(ma5) else 0:.2f} ({ma5_status})")
 
 
-def run_tail_market_screen():
-    """运行尾盘选股策略"""
-    strategy = TailMarketStrategy()
+def run_tail_market_screener():
+    """运行尾盘选股器"""
+    screener = TailMarketScreener()
     
     # 执行筛选
-    result = strategy.screen_tail_market_stocks(
-        min_change=1.3,           # 涨幅1.3%-5%
-        max_change=5.0,
-        min_volume_ratio=1.0,     # 量比大于1
-        min_turnover=5.0,         # 换手率5%-10%
-        max_turnover=10.0,
-        min_market_cap=50,        # 流通市值50-200亿
-        max_market_cap=200,
-        max_stocks=200
+    result = screener.screen_stocks(
+        min_change=3.0,
+        max_change=7.0,
+        min_turnover=5.0,
+        max_turnover=15.0,
+        min_market_cap=40,
+        max_market_cap=300,
+        max_stocks_to_analyze=200
     )
     
     if not result.empty:
-        strategy.print_results()
-        strategy.save_results()
+        # 打印结果
+        screener.print_results(top_n=20)
+        
+        # 保存结果
+        screener.save_results()
         
         print("\n" + "=" * 70)
-        print("策略说明:")
-        print("  ✓ 涨幅: 1.3%-5%")
-        print("  ✓ 量比: >1")
-        print("  ✓ 换手率: 5%-10%")
-        print("  ✓ 流通市值: 50-200亿")
-        print("  ✓ 成交量: 阶梯式抬高")
-        print("  ✓ 均线: 5/10/20/60多头排列")
-        print("  ✓ 分时: 价格在均价线之上")
-        print("  ✓ 尾盘: 创新高且节奏清晰")
+        print("💡 策略说明:")
+        print("  ✓ 核心: 收盘>MA5, 最低≥MA5(未破线), MA5向上")
+        print("  ✓ 涨幅: 3%-7% (适中)")
+        print("  ✓ 换手率: 5%-15% (活跃)")
+        print("  ✓ 趋势: 5日涨幅>10%, 20日涨幅>15%")
+        print("  ✓ 昨日: 小幅调整(-3%~+1%)")
+        print("  ✓ 市值: 40-300亿")
         print("=" * 70)
 
 
 if __name__ == "__main__":
-    run_tail_market_screen()
+    run_tail_market_screener()
