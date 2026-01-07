@@ -1,0 +1,14 @@
+{
+  "include": [
+    "."
+  ],
+  "extraPaths": [
+    "./strategies",
+    "./src"
+  ],
+  "pythonVersion": "3.14",
+  "typeCheckingMode": "basic",
+  "venvPath": ".",
+  "venv": "myenv"
+}
+

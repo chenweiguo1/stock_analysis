@@ -6,9 +6,16 @@ import sys
 sys.path.append('strategies')
 
 from tail_market_strategy import run_tail_market_screener
+from tail_market_strategy_old import run_tail_market_screener_old
 
 if __name__ == "__main__":
     print("=" * 70)
     print("启动尾盘选股器 (14:30专用版)")
     print("=" * 70)
     run_tail_market_screener()
+
+    print("=" * 70)
+    print("启动尾盘old选股器 (14:30专用版)")
+    print("=" * 70)
+    run_tail_market_screener_old()
+

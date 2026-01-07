@@ -391,7 +391,7 @@ class TailMarketStrategy:
         print(f"\n结果已保存到: {filename}")
 
 
-def run_tail_market_screen():
+def run_tail_market_screener_old():
     """运行尾盘选股策略"""
     strategy = TailMarketStrategy()
     
