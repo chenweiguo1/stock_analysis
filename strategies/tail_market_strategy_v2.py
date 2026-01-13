@@ -1,6 +1,6 @@
 """
-尾盘选股策略 (14:30专用版) - 优化版
-基于日盈电子(603286)案例分析并优化
+尾盘选股策略 V2 (支持历史回测)
+可指定日期进行历史筛选，验证策略有效性
 
 核心选股逻辑:
 1. 技术面(核心): 收盘>MA5, 最低≥MA5(未破线), MA5向上
@@ -8,18 +8,9 @@
 3. 趋势面: 5日涨幅10%-15%, 20日涨幅15%-25%, 昨日小幅调整
 4. 防追高: 收盘偏离MA5≤3%, 涨幅上限控制
 
-优化说明 (2026-01-07):
-- 新增收盘偏离MA5上限(≤3%)，避免追高
-- 新增5日涨幅上限(≤15%)，防止短期涨幅透支
-- 新增20日涨幅上限(≤25%)，防止中期涨幅透支
-- 案例教训: 日盈电子(603286) 1月6日选中后次日下跌
-  原因: 偏离MA5达5.46%, 5日涨幅18.74%, 20日涨幅31.28%
-  均超过安全阈值，追高风险大
-
-原案例: 2026-01-06 日盈电子(选中但次日失败)
-- 价格: 71.37, +5.06%
-- MA5: 67.67, 偏离5.46% ← 超过3%上限
-- 趋势: 5日+18.74%, 20日+31.28% ← 均超过安全上限
+使用方法:
+1. 实时筛选: run_tail_market_screener_v2()
+2. 历史回测: run_tail_market_screener_v2(target_date="20260106")
 """
 import pandas as pd
 import numpy as np
@@ -33,15 +24,31 @@ from src.data_fetcher import StockDataFetcher
 from src.technical_analysis import TechnicalIndicators
 
 
-class TailMarketScreener:
-    """尾盘选股器 (14:30版)"""
+class TailMarketScreenerV2:
+    """尾盘选股器 V2 (支持历史回测)"""
     
     def __init__(self):
         self.fetcher = StockDataFetcher()
         self.hot_sectors = []
         self.results = []
+        self.target_date = None  # 目标日期
         
-    def get_hot_sectors(self) -> List[Dict]:
+    def set_target_date(self, date_str: str = None):
+        """
+        设置目标日期
+        
+        Args:
+            date_str: 日期字符串，格式YYYYMMDD，如"20260106"
+                      如果为None则使用当前日期
+        """
+        if date_str:
+            self.target_date = datetime.strptime(date_str, "%Y%m%d")
+            print(f"\n📅 目标日期: {self.target_date.strftime('%Y-%m-%d')}")
+        else:
+            self.target_date = datetime.now()
+            print(f"\n📅 使用当前日期: {self.target_date.strftime('%Y-%m-%d')}")
+        
+    def get_hot_sectors(self) -> pd.DataFrame:
         """获取当日热门板块"""
         print("\n【第0步】识别热门板块...")
         print("-" * 60)
@@ -152,7 +159,55 @@ class TailMarketScreener:
             'reason': f"5日{gain_5d:.1f}%({'✓' if cond1 and cond2 else '✗'}) 20日{gain_20d:.1f}%({'✓' if cond3 and cond4 else '✗'}) 昨日{yesterday_change:.2f}%"
         }
     
+    def get_next_day_performance(self, symbol: str, target_date: datetime) -> Dict:
+        """
+        获取次日表现(用于验证策略)
+        
+        Args:
+            symbol: 股票代码
+            target_date: 选股日期
+            
+        Returns:
+            dict: 次日表现数据
+        """
+        try:
+            # 获取选股日期后两天的数据
+            start_date = target_date.strftime("%Y%m%d")
+            end_date = (target_date + timedelta(days=10)).strftime("%Y%m%d")
+            
+            df = self.fetcher.get_stock_hist(symbol, start_date, end_date)
+            
+            if df.empty or len(df) < 2:
+                return {'available': False, 'reason': '次日数据不足'}
+            
+            # 找到目标日期后的第一个交易日
+            df['日期'] = pd.to_datetime(df['日期'])
+            target_date_only = target_date.date()
+            
+            # 获取目标日期及之后的数据
+            future_data = df[df['日期'].dt.date > target_date_only]
+            
+            if future_data.empty:
+                return {'available': False, 'reason': '无次日数据'}
+            
+            next_day = future_data.iloc[0]
+            
+            return {
+                'available': True,
+                'next_date': next_day['日期'].strftime('%Y-%m-%d'),
+                'next_open': next_day['开盘'],
+                'next_close': next_day['收盘'],
+                'next_high': next_day['最高'],
+                'next_low': next_day['最低'],
+                'next_change': next_day['涨跌幅'],
+                'next_turnover': next_day.get('换手率', 0)
+            }
+            
+        except Exception as e:
+            return {'available': False, 'reason': str(e)}
+    
     def screen_stocks(self,
+                     target_date: str = None,
                      min_change: float = 3.0,
                      max_change: float = 7.0,
                      min_turnover: float = 5.0,
@@ -164,12 +219,27 @@ class TailMarketScreener:
                      max_gain_5d: float = 15.0,  # 5日最大涨幅(防止追高)
                      min_gain_20d: float = 15.0,  # 20日最小涨幅
                      max_gain_20d: float = 25.0,  # 20日最大涨幅(防止追高)
-                     max_stocks_to_analyze: int = 100) -> pd.DataFrame:
-        """尾盘选股主函数"""
+                     max_stocks_to_analyze: int = 100,
+                     check_next_day: bool = False) -> pd.DataFrame:
+        """
+        尾盘选股主函数 (支持历史回测)
+        
+        Args:
+            target_date: 目标日期，格式YYYYMMDD，如"20260106"。None表示当前日期
+            check_next_day: 是否检查次日表现(回测模式)
+            其他参数同原版本
+        """
         print("=" * 70)
-        print("🔥 尾盘选股器 - 14:30专用")
+        print("🔥 尾盘选股器 V2 - 支持历史回测")
         print("=" * 70)
-        print(f"\n运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 设置目标日期
+        self.set_target_date(target_date)
+        
+        end_date = self.target_date.strftime("%Y%m%d")
+        start_date = (self.target_date - timedelta(days=60)).strftime("%Y%m%d")
+        
+        print(f"数据范围: {start_date} ~ {end_date}")
         
         # 第0步: 识别热门板块
         stock_list = self.get_hot_sectors()
@@ -178,7 +248,7 @@ class TailMarketScreener:
             print("无法获取股票列表")
             return pd.DataFrame()
         
-        # 第1步: 基础筛选
+        # 第1步: 基础筛选(与原版本顺序一致)
         print("\n【第1步】基础条件筛选...")
         print("-" * 60)
         
@@ -210,20 +280,18 @@ class TailMarketScreener:
             print("\n❌ 没有股票通过基础筛选")
             return pd.DataFrame()
         
-        # 限制分析数量
+        # 限制分析数量(按涨幅排序取前N只,与原版本一致)
         if len(filtered) > max_stocks_to_analyze:
             print(f"\n  候选股票较多,取涨幅靠前的{max_stocks_to_analyze}只")
             filtered = filtered.sort_values('涨跌幅', ascending=False).head(max_stocks_to_analyze)
         
         print(f"\n  ✅ 通过基础筛选: {len(filtered)} 只")
         
-        # 第2步: 技术面筛选(MA5核心条件)
+        # 第2步: 技术面筛选(MA5核心)
         print("\n【第2步】技术面筛选(MA5核心)...")
         print("-" * 60)
         
         qualified = []
-        end_date = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
         
         for idx, row in filtered.iterrows():
             symbol = row['代码']
@@ -232,7 +300,7 @@ class TailMarketScreener:
             print(f"  [{idx+1}/{len(filtered)}] {symbol} {name}...", end="", flush=True)
             
             try:
-                # 获取历史数据
+                # 获取历史数据(截止到目标日期)
                 df = self.fetcher.get_stock_hist(
                     symbol=symbol,
                     start_date=start_date,
@@ -264,11 +332,12 @@ class TailMarketScreener:
                     continue
                 
                 # 通过所有条件!
-                print(f" ✓✓ 符合!")
+                print(f" ✓✓ 符合!", end="")
                 
-                qualified.append({
+                result_item = {
                     '代码': symbol,
                     '名称': name,
+                    '选股日期': self.target_date.strftime('%Y-%m-%d'),
                     '最新价': row['最新价'],
                     '涨跌幅': row['涨跌幅'],
                     '换手率': row['换手率'],
@@ -280,7 +349,25 @@ class TailMarketScreener:
                     '5日涨幅': trend_result['gain_5d'],
                     '20日涨幅': trend_result['gain_20d'],
                     '昨日涨跌': trend_result['yesterday_change']
-                })
+                }
+                
+                # 检查次日表现(回测模式)
+                if check_next_day:
+                    next_day = self.get_next_day_performance(symbol, self.target_date)
+                    if next_day['available']:
+                        result_item['次日日期'] = next_day['next_date']
+                        result_item['次日涨跌'] = next_day['next_change']
+                        result_item['次日开盘'] = next_day['next_open']
+                        result_item['次日收盘'] = next_day['next_close']
+                        print(f" → 次日{next_day['next_change']:+.2f}%")
+                    else:
+                        result_item['次日日期'] = '无数据'
+                        result_item['次日涨跌'] = None
+                        print(f" → 次日无数据")
+                else:
+                    print("")
+                
+                qualified.append(result_item)
                 
                 time.sleep(0.3)  # 避免请求过快
                 
@@ -329,8 +416,15 @@ class TailMarketScreener:
         display_df_formatted['20日涨幅'] = display_df_formatted['20日涨幅'].apply(lambda x: f"{x:+.2f}%")
         
         # 选择显示列
-        columns_to_show = ['代码', '名称', '最新价', '涨跌幅', '换手率', '总市值', 
-                          'MA5', '收盘偏离MA5', '5日涨幅', '20日涨幅']
+        columns_to_show = ['代码', '名称', '选股日期', '最新价', '涨跌幅', '换手率', 
+                          '收盘偏离MA5', '5日涨幅', '20日涨幅']
+        
+        # 如果有次日数据，添加到显示列
+        if '次日涨跌' in display_df_formatted.columns:
+            display_df_formatted['次日涨跌'] = display_df_formatted['次日涨跌'].apply(
+                lambda x: f"{x:+.2f}%" if pd.notna(x) else "无数据"
+            )
+            columns_to_show.append('次日涨跌')
         
         print(display_df_formatted[columns_to_show].to_string(index=False))
         print("=" * 100)
@@ -341,6 +435,18 @@ class TailMarketScreener:
         print(f"  平均换手: {display_df['换手率'].mean():.2f}%")
         print(f"  平均5日涨幅: {display_df['5日涨幅'].mean():.2f}%")
         print(f"  平均20日涨幅: {display_df['20日涨幅'].mean():.2f}%")
+        
+        # 如果有次日数据，显示次日统计
+        if '次日涨跌' in display_df.columns:
+            valid_next_day = display_df['次日涨跌'].dropna()
+            if len(valid_next_day) > 0:
+                print(f"\n📊 次日表现统计:")
+                print(f"  有效样本: {len(valid_next_day)} 只")
+                print(f"  平均次日涨跌: {valid_next_day.mean():+.2f}%")
+                print(f"  上涨数量: {(valid_next_day > 0).sum()} 只 ({(valid_next_day > 0).sum()/len(valid_next_day)*100:.1f}%)")
+                print(f"  下跌数量: {(valid_next_day < 0).sum()} 只 ({(valid_next_day < 0).sum()/len(valid_next_day)*100:.1f}%)")
+                print(f"  最大涨幅: {valid_next_day.max():+.2f}%")
+                print(f"  最大跌幅: {valid_next_day.min():+.2f}%")
     
     def save_results(self, filename: str = None):
         """保存筛选结果"""
@@ -349,50 +455,33 @@ class TailMarketScreener:
             return
         
         if filename is None:
-            filename = f"data/tail_market_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            date_str = self.target_date.strftime('%Y%m%d') if self.target_date else datetime.now().strftime('%Y%m%d')
+            filename = f"data/tail_market_v2_{date_str}_{datetime.now().strftime('%H%M%S')}.csv"
         
         self.results.to_csv(filename, index=False, encoding='utf-8-sig')
         print(f"\n💾 结果已保存到: {filename}")
+
+
+def run_tail_market_screener_v2(target_date: str = None, check_next_day: bool = False):
+    """
+    运行尾盘选股器V2
     
-    def get_stock_detail(self, symbol: str):
-        """获取某只股票的详细分析"""
-        print(f"\n{'=' * 70}")
-        print(f"📊 {symbol} 详细分析")
-        print("=" * 70)
+    Args:
+        target_date: 目标日期，格式YYYYMMDD，如"20260106"。None表示当前日期
+        check_next_day: 是否检查次日表现(回测模式)
+    
+    Examples:
+        # 实时筛选
+        run_tail_market_screener_v2()
         
-        end_date = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
-        
-        df = self.fetcher.get_stock_hist(symbol, start_date, end_date)
-        
-        if df.empty:
-            print("无法获取数据")
-            return
-        
-        # 计算指标
-        df = TechnicalIndicators.calculate_ma(df, periods=[5, 10, 20, 60, 120])
-        
-        # 显示最近10天
-        print("\n最近10天行情:")
-        recent = df.tail(10)
-        for idx, row in recent.iterrows():
-            date = row['日期'].strftime('%Y-%m-%d')
-            close = row['收盘']
-            change = row['涨跌幅']
-            turnover = row.get('换手率', 0)
-            ma5 = row.get('MA5', 0)
-            
-            ma5_status = '✓' if close > ma5 and pd.notna(ma5) else '✗'
-            
-            print(f"  {date}: 收{close:.2f} {change:+.2f}% 换手{turnover:.2f}% MA5={ma5:.2f if pd.notna(ma5) else 0:.2f} ({ma5_status})")
-
-
-def run_tail_market_screener():
-    """运行尾盘选股器"""
-    screener = TailMarketScreener()
+        # 历史回测(指定日期并检查次日表现)
+        run_tail_market_screener_v2(target_date="20260106", check_next_day=True)
+    """
+    screener = TailMarketScreenerV2()
     
     # 执行筛选(已优化参数,防止追高)
     result = screener.screen_stocks(
+        target_date=target_date,
         min_change=3.0,
         max_change=7.0,
         min_turnover=5.0,
@@ -404,7 +493,8 @@ def run_tail_market_screener():
         max_gain_5d=15.0,       # 5日涨幅不超过15%(防止短期透支)
         min_gain_20d=15.0,      # 20日涨幅至少15%
         max_gain_20d=25.0,      # 20日涨幅不超过25%(防止中期透支)
-        max_stocks_to_analyze=200
+        max_stocks_to_analyze=300,
+        check_next_day=check_next_day
     )
     
     if not result.empty:
@@ -415,7 +505,7 @@ def run_tail_market_screener():
         screener.save_results()
         
         print("\n" + "=" * 70)
-        print("💡 策略说明(已优化-防止追高):")
+        print("💡 策略说明(V2-防止追高+支持回测):")
         print("  ✓ 核心: 收盘>MA5, 最低≥MA5(未破线), MA5向上")
         print("  ✓ 涨幅: 3%-7% (适中)")
         print("  ✓ 换手率: 5%-15% (活跃)")
@@ -423,8 +513,23 @@ def run_tail_market_screener():
         print("  ✓ 偏离: 收盘偏离MA5≤3% (防止追高)")
         print("  ✓ 昨日: 小幅调整(-3%~+1%)")
         print("  ✓ 市值: 40-300亿")
+        if check_next_day:
+            print("  ✓ 模式: 历史回测(含次日验证)")
         print("=" * 70)
+    
+    return screener
 
 
 if __name__ == "__main__":
-    run_tail_market_screener()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='尾盘选股器V2 - 支持历史回测')
+    parser.add_argument('--date', type=str, default=None, 
+                        help='目标日期，格式YYYYMMDD，如20260106')
+    parser.add_argument('--backtest', action='store_true',
+                        help='回测模式，检查次日表现')
+    
+    args = parser.parse_args()
+    
+    run_tail_market_screener_v2(target_date=args.date, check_next_day=args.backtest)
+
