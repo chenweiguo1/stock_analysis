@@ -7,6 +7,7 @@ A股数据获取模块
 2. 超时处理 - 设置更长的超时时间
 3. 缓存机制 - 减少重复请求
 4. 请求配置 - 优化HTTP请求参数
+5. IPv4优先 - 强制使用IPv4连接（解决东方财富IPv6不通问题）
 """
 import akshare as ak
 import pandas as pd
@@ -14,9 +15,56 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 import time
 from functools import wraps
+import socket
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+
+def force_ipv4(verbose: bool = True):
+    """
+    强制使用 IPv4 连接
+    东方财富等数据源可能不支持 IPv6，导致连接超时
+    
+    Args:
+        verbose: 是否打印连接的 IP 地址
+    """
+    # 保存原始的 getaddrinfo
+    original_getaddrinfo = socket.getaddrinfo
+    
+    # 记录已打印的主机，避免重复打印
+    printed_hosts = set()
+    
+    def ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        """只返回 IPv4 地址，并打印实际 IP"""
+        # 强制使用 IPv4 (AF_INET)
+        try:
+            result = original_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+            
+            # 打印解析结果（每个主机只打印一次）
+            if verbose and host not in printed_hosts and result:
+                # result 格式: [(family, type, proto, canonname, sockaddr), ...]
+                # sockaddr 格式: (ip, port)
+                ips = [str(item[4][0]) for item in result if item[4]]
+                if ips:
+                    printed_hosts.add(host)
+                    unique_ips = list(set(ips))
+                    print(f"  [DNS] {host} -> {', '.join(unique_ips)} (IPv4)")
+            
+            return result
+        except socket.gaierror as e:
+            # 如果 IPv4 解析失败，打印错误
+            if verbose:
+                print(f"  [DNS] {host} 解析失败: {e}")
+            raise
+    
+    # 替换为只使用 IPv4 的版本
+    socket.getaddrinfo = ipv4_only_getaddrinfo
+    print("  [网络] 已启用 IPv4 优先模式")
+
+
+# 启动时强制使用 IPv4
+force_ipv4(verbose=True)
 
 
 def configure_requests():
