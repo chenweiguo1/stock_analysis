@@ -1,12 +1,101 @@
 """
 A股数据获取模块
 使用 AKShare 获取A股实时和历史数据
+
+优化:
+1. 自动重试机制 - 网络请求失败时自动重试
+2. 超时处理 - 设置更长的超时时间
+3. 缓存机制 - 减少重复请求
+4. 请求配置 - 优化HTTP请求参数
 """
 import akshare as ak
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional, List
 import time
+from functools import wraps
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+def configure_requests():
+    """
+    配置 requests 默认参数
+    - 增加超时时间
+    - 配置重试策略
+    - 设置连接池
+    """
+    # 配置重试策略
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    
+    # 创建适配器
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=10,
+        pool_maxsize=10
+    )
+    
+    # 创建会话并挂载适配器
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # 设置默认超时（AKShare 内部使用 requests）
+    # 通过 monkey patch 设置默认超时
+    old_request = requests.Session.request
+    
+    def new_request(self, method, url, **kwargs):
+        # 设置默认超时为 30 秒
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = 30
+        return old_request(self, method, url, **kwargs)
+    
+    requests.Session.request = new_request
+    
+    return session
+
+
+# 初始化时配置 requests
+_session = configure_requests()
+
+
+def retry_request(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
+    """
+    重试装饰器 - 网络请求失败时自动重试
+    
+    Args:
+        max_retries: 最大重试次数
+        delay: 初始重试间隔（秒）
+        backoff: 退避系数（每次重试间隔乘以此系数）
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            current_delay = delay
+            
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        print(f"  请求失败 (尝试 {attempt + 1}/{max_retries}): {type(e).__name__}")
+                        print(f"  {current_delay:.1f}秒后重试...")
+                        time.sleep(current_delay)
+                        current_delay *= backoff
+                    else:
+                        print(f"  请求失败 (已重试{max_retries}次): {e}")
+            
+            # 返回 None 或空 DataFrame，而不是抛出异常
+            return None
+        return wrapper
+    return decorator
 
 
 class StockDataFetcher:
@@ -15,10 +104,95 @@ class StockDataFetcher:
     def __init__(self):
         """初始化数据获取器"""
         self.cache = {}
+        self._stock_list_cache = None
+        self._stock_list_cache_time = None
+        self._cache_ttl = 60  # 缓存有效期（秒）
     
-    def get_stock_list(self) -> pd.DataFrame:
+    def _normalize_stock_data(self, df: pd.DataFrame, source: str) -> pd.DataFrame:
+        """
+        统一不同数据源的字段名
+        
+        Args:
+            df: 原始数据
+            source: 数据源 ('em' 东方财富, 'sina' 新浪)
+            
+        Returns:
+            DataFrame: 统一字段名后的数据
+        """
+        if df is None or df.empty:
+            return df
+        
+        # 新浪接口字段映射 -> 东方财富字段
+        sina_mapping = {
+            'symbol': '代码',
+            'code': '代码', 
+            'name': '名称',
+            'trade': '最新价',
+            'price': '最新价',
+            'pricechange': '涨跌额',
+            'changepercent': '涨跌幅',
+            'buy': '买入',
+            'sell': '卖出',
+            'settlement': '昨收',
+            'open': '今开',
+            'high': '最高',
+            'low': '最低',
+            'volume': '成交量',
+            'amount': '成交额',
+            'ticktime': '时间',
+            'per': '市盈率-动态',
+            'pb': '市净率',
+            'mktcap': '总市值',
+            'nmc': '流通市值',
+            'turnoverratio': '换手率',
+        }
+        
+        if source == 'sina':
+            # 重命名列
+            df = df.rename(columns=sina_mapping)
+            
+            # 处理代码格式（新浪可能带 sh/sz 前缀）
+            if '代码' in df.columns:
+                df['代码'] = df['代码'].astype(str).str.replace(r'^(sh|sz)', '', regex=True)
+        
+        return df
+    
+    def _fetch_stock_list_raw(self) -> pd.DataFrame:
+        """
+        获取原始股票列表
+        优先使用东方财富接口，失败时尝试新浪接口
+        """
+        # 尝试东方财富接口
+        for attempt in range(3):
+            try:
+                print(f"  尝试东方财富接口 ({attempt + 1}/3)...")
+                df = ak.stock_zh_a_spot_em()
+                if df is not None and not df.empty:
+                    print(f"  成功获取 {len(df)} 只股票")
+                    return self._normalize_stock_data(df, 'em')
+            except Exception as e:
+                print(f"  东方财富接口失败: {type(e).__name__}")
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+        
+        # 尝试新浪接口作为备用
+        print("  尝试新浪备用接口...")
+        try:
+            df = ak.stock_zh_a_spot()
+            if df is not None and not df.empty:
+                print(f"  新浪接口成功，获取 {len(df)} 只股票")
+                return self._normalize_stock_data(df, 'sina')
+        except Exception as e:
+            print(f"  新浪接口也失败: {e}")
+        
+        return None
+    
+    def get_stock_list(self, use_cache: bool = True) -> pd.DataFrame:
         """
         获取A股股票列表
+        
+        Args:
+            use_cache: 是否使用缓存（60秒内有效）
         
         Returns:
             DataFrame: 包含股票代码、名称等信息
@@ -49,13 +223,52 @@ class StockDataFetcher:
             60日涨跌幅	float64	注意单位: %
             年初至今涨跌幅	float64	注意单位: %
         """
+        # 检查缓存是否有效
+        if use_cache and self._stock_list_cache is not None:
+            if self._stock_list_cache_time:
+                elapsed = (datetime.now() - self._stock_list_cache_time).total_seconds()
+                if elapsed < self._cache_ttl:
+                    print(f"  使用缓存数据 (有效期还剩 {self._cache_ttl - elapsed:.0f}秒)")
+                    return self._stock_list_cache
+        
         try:
-            # 获取沪深A股列表
-            stock_list = ak.stock_zh_a_spot_em()
-            return stock_list[['代码', '名称', '最新价', '涨跌幅', '换手率', '市盈率-动态', '总市值']]
+            # 获取沪深A股列表（带重试）
+            stock_list = self._fetch_stock_list_raw()
+            
+            if stock_list is None or stock_list.empty:
+                print("获取股票列表失败: 返回数据为空")
+                return pd.DataFrame()
+            
+            # 选择需要的列（包含更多字段以支持策略分析）
+            columns_needed = ['代码', '名称', '最新价', '涨跌幅', '换手率', 
+                            '市盈率-动态', '总市值', '流通市值', '成交量',
+                            '今开', '最高', '最低', '振幅', '量比']
+            
+            # 只选择存在的列
+            available_columns = [c for c in columns_needed if c in stock_list.columns]
+            result = stock_list[available_columns]
+            
+            # 更新缓存
+            self._stock_list_cache = result
+            self._stock_list_cache_time = datetime.now()
+            
+            return result
+            
         except Exception as e:
             print(f"获取股票列表失败: {e}")
             return pd.DataFrame()
+    
+    @retry_request(max_retries=3, delay=0.5, backoff=1.5)
+    def _fetch_stock_hist_raw(self, symbol: str, period: str, 
+                               start_date: str, end_date: str, adjust: str) -> pd.DataFrame:
+        """获取原始历史数据（带重试）"""
+        return ak.stock_zh_a_hist(
+            symbol=symbol,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust
+        )
     
     def get_stock_hist(self, 
                        symbol: str, 
@@ -82,44 +295,61 @@ class StockDataFetcher:
             start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
         
         try:
-            df = ak.stock_zh_a_hist(
-                symbol=symbol,
-                period=period,
-                start_date=start_date,
-                end_date=end_date,
-                adjust=adjust
-            )
+            df = self._fetch_stock_hist_raw(symbol, period, start_date, end_date, adjust)
             
-            if not df.empty:
-                df['日期'] = pd.to_datetime(df['日期'])
-                df = df.sort_values('日期')
-                df.reset_index(drop=True, inplace=True)
+            if df is None or df.empty:
+                return pd.DataFrame()
+            
+            df['日期'] = pd.to_datetime(df['日期'])
+            df = df.sort_values('日期')
+            df.reset_index(drop=True, inplace=True)
             
             return df
         except Exception as e:
-            print(f"获取股票 {symbol} 历史数据失败: {e}")
+            # 静默处理，避免打印过多错误
             return pd.DataFrame()
     
-    def get_stock_realtime(self, symbol: str) -> dict:
+    def get_stock_realtime(self, symbol: str, use_cache: bool = True) -> dict:
         """
-        获取股票实时行情
+        获取股票实时行情 - 优化版
+        
+        优先使用缓存的股票列表数据，避免重复网络请求
         
         Args:
             symbol: 股票代码
+            use_cache: 是否使用缓存数据
             
         Returns:
             dict: 实时行情数据
         """
         try:
-            df = ak.stock_zh_a_spot_em()
+            # 优先使用缓存数据
+            if use_cache and self._stock_list_cache is not None:
+                if self._stock_list_cache_time:
+                    elapsed = (datetime.now() - self._stock_list_cache_time).total_seconds()
+                    if elapsed < self._cache_ttl:
+                        # 从缓存中查找
+                        stock_data = self._stock_list_cache[
+                            self._stock_list_cache['代码'] == symbol
+                        ]
+                        if not stock_data.empty:
+                            return stock_data.iloc[0].to_dict()
+            
+            # 缓存不可用，获取新数据（带重试）
+            df = self._fetch_stock_list_raw()
+            
+            if df is None or df.empty:
+                return {}
+            
             stock_data = df[df['代码'] == symbol]
             
             if stock_data.empty:
                 return {}
             
             return stock_data.iloc[0].to_dict()
+            
         except Exception as e:
-            print(f"获取股票 {symbol} 实时数据失败: {e}")
+            # 静默处理，避免打印过多错误信息
             return {}
     
     def get_stock_info(self, symbol: str) -> dict:
